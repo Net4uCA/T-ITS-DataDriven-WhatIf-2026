@@ -1,15 +1,9 @@
 """
-step2_discomfort.py — Conversione wide→leg + calcolo GC e ΔD
-Inputs:  output_v2/trips_clean.csv
-         alternative_otp_*.csv
-         time_offsets_*.csv
-Outputs: output_v2/alternatives_gc.csv   (una riga per alternativa con fasi e GC)
-         output_v2/delta_d_per_trip.csv  (una riga per viaggio: migliore alternativa)
+step2_discomfort.py — Calcolo GC_jk e Delta_D per PV e PT trips
+Output: output_v2/alternatives_gc.csv
+        output_v2/delta_d_per_trip.csv
 
-Modello matematico (paper v2, Eq. 2-5):
-  GC_jk = β_walk·T_walk + β_wait·T_wait + β_ride·T_ride + β_trans·T_trans
-  ΔD_jk = GC_jk − GC_j0
-  Per ogni viaggio: seleziona alternativa con ΔD minimo (best_alternative).
+Delta_D = GC_PT - GC_PV
 """
 
 import os
@@ -18,11 +12,9 @@ import pandas as pd
 import config
 
 
-# ──────────────────────────────────────────────────────────────────────────────────────
-# Helper: parse "HH:MM:SS" → secondi dall'inizio della giornata
-# ──────────────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
 def parse_time_s(t):
-    """'HH:MM:SS' → float secondi. Ritorna NaN se non parsabile."""
+    """'HH:MM:SS' -> secondi dall'inizio della giornata."""
     try:
         h, m, s = str(t).strip().split(":")
         return float(h) * 3600 + float(m) * 60 + float(s)
@@ -32,109 +24,72 @@ def parse_time_s(t):
 
 def transfer_wait_s(walk_to_time, next_bus_from_time):
     """
-    Calcola l'attesa al trasbordo in secondi.
-    wait = next_bus_from_time - walk_to_time
-    Applica il cap a TRANSFER_WAIT_CAP_S.
-    Se il risultato è negativo (midnight crossing), aggiunge 24h.
+    Attesa al trasbordo in secondi (capped a TRANSFER_WAIT_CAP_S).
     """
     t_walk_end = parse_time_s(walk_to_time)
     t_bus_dep  = parse_time_s(next_bus_from_time)
-
     if np.isnan(t_walk_end) or np.isnan(t_bus_dep):
         return np.nan
-
     wait = t_bus_dep - t_walk_end
     if wait < 0:
-        wait += 86400  # correzione midnight crossing
+        wait += 86400   # midnight crossing
     return min(wait, config.TRANSFER_WAIT_CAP_S)
 
 
-# ──────────────────────────────────────────────────────────────────────────────────────
-# Conversione wide → fasi aggregate (T_walk, T_wait, T_ride, T_trans)
-# per una singola riga del CSV delle alternative
-# ──────────────────────────────────────────────────────────────────────────────────────
-def extract_phases(row, offset_s):
+def extract_phases_pt_alternative(row, offset_s):
     """
-    Dato un dict/Series con le colonne wide dell'alternativa OTP
-    e l'offset temporale (secondi, già corretto per midnight),
-    ritorna:
-      T_walk_s, T_wait_s, T_ride_s, T_trans_s
-
-    Logica:
-      T_walk  = Σ walk_duration di tutti i leg wk e tr (secondi)
-      T_wait  = offset_s  (attesa alla prima fermata = tempo dall'istante
-                           di partenza osservato al momento in cui OTP
-                           fa partire il viaggio)
-      T_ride  = Σ bus_duration di tutti i leg rd (secondi)
-      T_trans = Σ wait_time di tutti i leg tr (secondi, capped)
+    Estrae T_walk, T_wait, T_ride, T_trans da una riga wide del CSV alternative OTP.
+    Ritorna None se l'alternativa e' walk-only (nessun leg ride).
     """
     T_walk  = 0.0
-    T_wait  = max(0.0, float(offset_s))   # garantisce non negativo
+    T_wait  = max(0.0, float(offset_s))
     T_ride  = 0.0
     T_trans = 0.0
+    has_ride = False
 
-    has_ride = False  # flag: almeno un leg rd presente
+    iw = row.get("initial_walk_duration")
+    if pd.notna(iw):
+        T_walk += float(iw)
 
-    # ── leg 1: initial_walk ────────────────────────────────────────────────────────────
-    iw_dur = row.get("initial_walk_duration")
-    if pd.notna(iw_dur):
-        T_walk += float(iw_dur)
+    fb = row.get("first_bus_duration")
+    if pd.notna(fb):
+        T_ride += float(fb); has_ride = True
 
-    # ── leg 2: first_bus ───────────────────────────────────────────────────────────────
-    fb_dur = row.get("first_bus_duration")
-    if pd.notna(fb_dur):
-        T_ride += float(fb_dur)
-        has_ride = True
+    mw1 = row.get("mid_walk1_duration")
+    if pd.notna(mw1):
+        T_walk += float(mw1)
+        w1 = transfer_wait_s(row.get("mid_walk1_to_time"),
+                             row.get("second_bus_from_time"))
+        if pd.notna(w1):
+            T_trans += w1
 
-    # ── leg 3: mid_walk1 + wait trasbordo 1 ───────────────────────────────────────────
-    mw1_dur = row.get("mid_walk1_duration")
-    if pd.notna(mw1_dur):
-        T_walk += float(mw1_dur)
-        wait1 = transfer_wait_s(row.get("mid_walk1_to_time"),
-                                row.get("second_bus_from_time"))
-        if pd.notna(wait1):
-            T_trans += wait1
+    sb = row.get("second_bus_duration")
+    if pd.notna(sb):
+        T_ride += float(sb); has_ride = True
 
-    # ── leg 4: second_bus ──────────────────────────────────────────────────────────────
-    sb_dur = row.get("second_bus_duration")
-    if pd.notna(sb_dur):
-        T_ride += float(sb_dur)
-        has_ride = True
+    mw2 = row.get("mid_walk2_duration")
+    if pd.notna(mw2):
+        T_walk += float(mw2)
+        w2 = transfer_wait_s(row.get("mid_walk2_to_time"),
+                             row.get("third_bus_from_time"))
+        if pd.notna(w2):
+            T_trans += w2
 
-    # ── leg 5: mid_walk2 + wait trasbordo 2 ───────────────────────────────────────────
-    mw2_dur = row.get("mid_walk2_duration")
-    if pd.notna(mw2_dur):
-        T_walk += float(mw2_dur)
-        wait2 = transfer_wait_s(row.get("mid_walk2_to_time"),
-                                row.get("third_bus_from_time"))
-        if pd.notna(wait2):
-            T_trans += wait2
+    tb = row.get("third_bus_duration")
+    if pd.notna(tb):
+        T_ride += float(tb); has_ride = True
 
-    # ── leg 6: third_bus ───────────────────────────────────────────────────────────────
-    tb_dur = row.get("third_bus_duration")
-    if pd.notna(tb_dur):
-        T_ride += float(tb_dur)
-        has_ride = True
-
-    # ── leg 7: final_walk ──────────────────────────────────────────────────────────────
-    fw_dur = row.get("final_walk_duration")
-    if pd.notna(fw_dur):
-        T_walk += float(fw_dur)
+    fw = row.get("final_walk_duration")
+    if pd.notna(fw):
+        T_walk += float(fw)
 
     if not has_ride:
-        return None  # alternativa walk-only → scartata
-
+        return None
     return T_walk, T_wait, T_ride, T_trans
 
 
-# ──────────────────────────────────────────────────────────────────────────────────────
-# Calcolo GC_jk (Eq. 2) — in β-weighted minutes
-# ──────────────────────────────────────────────────────────────────────────────────────
-def calc_gc_jk(T_walk_s, T_wait_s, T_ride_s, T_trans_s):
-    """
-    GC_jk = β_walk·T_walk_min + β_wait·T_wait_min
-           + β_ride·T_ride_min + β_trans·T_trans_min
-    """
+def calc_gc_pt(T_walk_s, T_wait_s, T_ride_s, T_trans_s):
+    """GC di un itinerario PT (Eq. 2) in beta-weighted minutes."""
     return (
         config.BETA["walk"]  * T_walk_s  / 60.0 +
         config.BETA["wait"]  * T_wait_s  / 60.0 +
@@ -143,64 +98,57 @@ def calc_gc_jk(T_walk_s, T_wait_s, T_ride_s, T_trans_s):
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────────────
-# Pipeline principale
-# ──────────────────────────────────────────────────────────────────────────────────────
 def run():
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
     print("=" * 60)
-    print("STEP 2 — Calcolo ΔD (Differential Generalized Discomfort)")
+    print("STEP 2 — Calcolo GC_jk e Delta_D")
     print("=" * 60)
+    print("  Convenzione: Delta_D = GC_PT - GC_PV (sempre)")
+    print()
 
-    # ── 1. Carica dati ─────────────────────────────────────────────────────────────────
     trips = pd.read_csv(os.path.join(config.OUTPUT_DIR, "trips_clean.csv"))
     alt   = pd.read_csv(config.FILE_ALT)
     off   = pd.read_csv(config.FILE_OFFSETS)
 
-    print(f"  Spostamenti puliti:   {len(trips):>7}")
-    print(f"  Alternative raw:      {len(alt):>7}")
-    print(f"  Offsets:              {len(off):>7}")
+    pv_trips = trips[trips["is_pv"]].copy()
+    pt_trips = trips[~trips["is_pv"]].copy()
 
-    # ── 2. Filtra alternative NO_VALID_ROUTES ──────────────────────────────────────────
-    alt = alt[alt["status"].isna()].copy()   # NaN = valida (no status = ok)
-    print(f"  Alternative valide:   {len(alt):>7}  (dopo filtro status)")
+    print(f"  Trip PV (auto/moto):  {len(pv_trips):>7}")
+    print(f"  Trip PT (bus):        {len(pt_trips):>7}")
 
-    # ── 3. Filtra alternative walk-only ────────────────────────────────────────────────
-    alt = alt[alt["first_bus_duration"].notna()].copy()
-    print(f"  Alternative con bus:  {len(alt):>7}  (dopo filtro walk-only)")
+    # =========================================================
+    # BLOCCO A — Trip PV: GC_jk dalle leg OTP
+    # =========================================================
+    print()
+    print("  [A] Calcolo Delta_D per trip PV -> alternativa PT")
 
-    # ── 4. Merge con offsets ───────────────────────────────────────────────────────────
+    alt_valid = alt[alt["status"].isna() & alt["first_bus_duration"].notna()].copy()
+    print(f"      Alternative PT valide nel CSV: {len(alt_valid):>7}")
+
     off_ok = off[off["status"] == "OK"][
         ["id_spostamento", "utente", "id_alternativa", "offset(secondi)"]
     ].copy()
-    alt = alt.merge(off_ok,
-                    on=["id_spostamento", "utente", "id_alternativa"],
-                    how="left")
+    alt_valid = alt_valid.merge(off_ok,
+                                on=["id_spostamento", "utente", "id_alternativa"],
+                                how="left")
 
-    # ── 5. Correzione midnight crossing sugli offset ───────────────────────────────────
-    #   Se offset < 0 → l'alternativa OTP era già partita prima
-    #   del viaggio osservato (midnight crossing) → aggiungi 24h
-    alt["offset_corretto"] = alt["offset(secondi)"].apply(
+    alt_valid["offset_corretto"] = alt_valid["offset(secondi)"].apply(
         lambda x: (x + 86400) if (pd.notna(x) and x < 0) else x
-    )
-    # Dove l'offset manca, usa 0 (nessun attesa iniziale stimata)
-    alt["offset_corretto"] = alt["offset_corretto"].fillna(0.0)
+    ).fillna(0.0)
 
-    # ── 6. Calcola fasi (T_walk, T_wait, T_ride, T_trans) ─
-    records = []
+    records_pv = []
     skipped_walk_only = 0
 
-    for _, row in alt.iterrows():
-        result = extract_phases(row, row["offset_corretto"])
+    for _, row in alt_valid.iterrows():
+        result = extract_phases_pt_alternative(row, row["offset_corretto"])
         if result is None:
             skipped_walk_only += 1
             continue
         T_walk_s, T_wait_s, T_ride_s, T_trans_s = result
+        gc_jk_pt = calc_gc_pt(T_walk_s, T_wait_s, T_ride_s, T_trans_s)
 
-        gc_jk = calc_gc_jk(T_walk_s, T_wait_s, T_ride_s, T_trans_s)
-
-        records.append({
+        records_pv.append({
             "trip_id":       row["id_spostamento"],
             "user_id":       row["utente"],
             "alt_id":        row["id_alternativa"],
@@ -208,63 +156,114 @@ def run():
             "T_wait_min":    T_wait_s  / 60.0,
             "T_ride_min":    T_ride_s  / 60.0,
             "T_trans_min":   T_trans_s / 60.0,
-            "GC_jk":         gc_jk,
+            "GC_jk":         gc_jk_pt,
+            "alt_type":      "PT",
         })
 
-    print(f"\n  Walk-only scartate:   {skipped_walk_only:>7}")
-    print(f"  Alternative calcolate:{len(records):>7}")
+    print(f"      Walk-only scartate:        {skipped_walk_only:>7}")
+    print(f"      Alternative calcolate:     {len(records_pv):>7}")
 
-    alts_gc = pd.DataFrame(records)
+    alts_pv = pd.DataFrame(records_pv)
 
-    # ── 7. Merge con trips per ottenere GC_j0 e metadati ───────────────────────────────
-    alts_gc = alts_gc.merge(
-        trips[["trip_id", "user_id", "mode", "is_pv",
-               "gc_j0", "lat_o", "lon_o", "lat_d", "lon_d",
-               "datetime_start", "duration_s"]],
+    # Merge con trips PV per GC_j0
+    alts_pv = alts_pv.merge(
+        pv_trips[["trip_id", "user_id", "mode", "is_pv",
+                  "gc_j0", "lat_o", "lon_o", "lat_d", "lon_d",
+                  "datetime_start", "duration_s", "est_car_duration_s"]],
         on=["trip_id", "user_id"], how="inner"
     )
 
-    # ── 8. ΔD_jk = GC_jk − GC_j0 (Eq. 4) ───────────────────────────────────────────────
-    alts_gc["delta_D"] = alts_gc["GC_jk"] - alts_gc["gc_j0"]
+    # Delta_D = GC_PT - GC_PV
+    alts_pv["delta_D"] = alts_pv["GC_jk"] - alts_pv["gc_j0"]
 
-    # ── 9. Per ogni viaggio: seleziona la migliore alternativa (min ΔD)
-    best_idx = alts_gc.groupby("trip_id")["delta_D"].idxmin()
-    best = alts_gc.loc[best_idx].copy().reset_index(drop=True)
+    # Miglior alternativa per ogni viaggio PV (min Delta_D)
+    best_pv_idx = alts_pv.groupby("trip_id")["delta_D"].idxmin()
+    best_pv = alts_pv.loc[best_pv_idx].copy().reset_index(drop=True)
 
-    # ── 10. Statistiche ────────────────────────────────────────────────────────────────
-    pv_mask = best["is_pv"]
-    pt_mask = ~best["is_pv"]
-    print(f"\n  Viaggi con ΔD valido: {len(best):>7}")
-    print(f"    di cui PV (auto/moto): {pv_mask.sum()}")
-    print(f"    di cui PT (bus):       {pt_mask.sum()}")
+    print(f"\n      Trip PV con Delta_D valido: {len(best_pv):>6}")
+    print(f"      Delta_D medio PV: {best_pv['delta_D'].mean():.2f} min  "
+          f"(mediana: {best_pv['delta_D'].median():.2f})")
 
-    if pv_mask.sum() > 0:
-        pv_d = best.loc[pv_mask, "delta_D"]
-        print(f"\n  ΔD utenti PV — media: {pv_d.mean():.2f}, "
-              f"mediana: {pv_d.median():.2f}, std: {pv_d.std():.2f}")
-        print(f"    p25={pv_d.quantile(.25):.2f}, "
-              f"p75={pv_d.quantile(.75):.2f}, "
-              f"p95={pv_d.quantile(.95):.2f}")
+    # =========================================================
+    # BLOCCO B — Trip PT: GC_jk = beta_ride x est_car_duration / 60
+    # =========================================================
+    print()
+    print("  [B] Calcolo Delta_D per trip PT -> alternativa PV")
+    print("      (usa est_car_duration_s dal CSV spostamenti, NON il CSV alternative)")
 
-    if pt_mask.sum() > 0:
-        pt_d = best.loc[pt_mask, "delta_D"]
-        print(f"\n  ΔD utenti PT — media: {pt_d.mean():.2f}, "
-              f"mediana: {pt_d.median():.2f}, std: {pt_d.std():.2f}")
-        print(f"    p25={pt_d.quantile(.25):.2f}, "
-              f"p75={pt_d.quantile(.75):.2f}, "
-              f"p95={pt_d.quantile(.95):.2f}")
+    pt_valid = pt_trips.dropna(subset=["est_car_duration_s"]).copy()
+    n_dropped = len(pt_trips) - len(pt_valid)
+    if n_dropped > 0:
+        print(f"      Rimossi {n_dropped} trip PT senza est_car_duration_s")
 
-    # ── 11. Salva output ───────────────────────────────────────────────────────────────
-    out_gc   = os.path.join(config.OUTPUT_DIR, "alternatives_gc.csv")
+    # GC_jk per l'alternativa PV: solo fase ride, door-to-door
+    pt_valid["GC_jk"]     = config.BETA["ride"] * pt_valid["est_car_duration_s"] / 60.0
+    pt_valid["alt_type"]  = "PV"
+
+    # Delta_D = GC_PT (osservato) - GC_PV (alternativa auto)
+    # = gc_j0 - GC_jk
+    # che e' equivalente a GC_PT - GC_PV con il segno corretto
+    pt_valid["delta_D"] = pt_valid["gc_j0"] - pt_valid["GC_jk"]
+
+    # Colonne fasi: per i PT trips la leg osservata e' approssimata a ride unica
+    # T_walk, T_wait, T_trans = 0 (non disponibili per il bus osservato)
+    # T_ride = duration_s / 60
+    pt_valid["T_walk_min"]  = 0.0
+    pt_valid["T_wait_min"]  = 0.0
+    pt_valid["T_ride_min"]  = pt_valid["duration_s"] / 60.0
+    pt_valid["T_trans_min"] = 0.0
+    pt_valid["alt_id"]      = "car_otp"
+
+    # Per i PT trips non c'e' selezione tra alternative (una sola alternativa auto)
+    best_pt = pt_valid[[
+        "trip_id", "user_id", "alt_id", "alt_type",
+        "T_walk_min", "T_wait_min", "T_ride_min", "T_trans_min",
+        "GC_jk", "mode", "is_pv", "gc_j0",
+        "lat_o", "lon_o", "lat_d", "lon_d",
+        "datetime_start", "duration_s", "est_car_duration_s",
+        "delta_D",
+    ]].copy().reset_index(drop=True)
+
+    print(f"\n      Trip PT con Delta_D valido: {len(best_pt):>6}")
+    print(f"      Delta_D medio PT: {best_pt['delta_D'].mean():.2f} min  "
+          f"(mediana: {best_pt['delta_D'].median():.2f})")
+
+    # =========================================================
+    # Unione PV + PT
+    # =========================================================
+    # Allinea colonne
+    pv_cols = set(best_pv.columns)
+    pt_cols = set(best_pt.columns)
+
+    for c in pv_cols - pt_cols:
+        best_pt[c] = np.nan
+    for c in pt_cols - pv_cols:
+        best_pv[c] = np.nan
+
+    best = pd.concat([best_pv, best_pt], ignore_index=True)
+
+    print()
+    print(f"  Totale viaggi con Delta_D: {len(best):>7}")
+    pv_d = best.loc[best["is_pv"],  "delta_D"]
+    pt_d = best.loc[~best["is_pv"], "delta_D"]
+    print(f"    PV: n={len(pv_d)}  media={pv_d.mean():.1f}  mediana={pv_d.median():.1f}  std={pv_d.std():.1f}")
+    print(f"    PT: n={len(pt_d)}  media={pt_d.mean():.1f}  mediana={pt_d.median():.1f}  std={pt_d.std():.1f}")
+    print()
+    print(f"    Delta_D PV > 0: {(pv_d > 0).sum()} ({100*(pv_d>0).mean():.1f}%)")
+    print(f"    Delta_D PT > 0: {(pt_d > 0).sum()} ({100*(pt_d>0).mean():.1f}%)")
+    print(f"    Delta_D PT < 0: {(pt_d < 0).sum()} ({100*(pt_d<0).mean():.1f}%)")
+
+    # Salva
+    out_alts = os.path.join(config.OUTPUT_DIR, "alternatives_gc.csv")
     out_best = os.path.join(config.OUTPUT_DIR, "delta_d_per_trip.csv")
 
-    alts_gc.to_csv(out_gc,   index=False)
+    alts_pv.to_csv(out_alts, index=False)
     best.to_csv(out_best, index=False)
 
-    print(f"\n  ✓ Salvato: {out_gc}")
-    print(f"  ✓ Salvato: {out_best}")
+    print(f"\n  Salvato: {out_alts}")
+    print(f"  Salvato: {out_best}")
 
-    return alts_gc, best
+    return alts_pv, best
 
 
 if __name__ == "__main__":
